@@ -307,67 +307,80 @@ public class DoSFilter implements Filter
 
         // Look for the rate tracker for this request.
         RateTracker tracker = (RateTracker)request.getAttribute(__TRACKER);
-        if (tracker == null)
+        if (tracker != null)
         {
-            // This is the first time we have seen this request.
-            if (LOG.isDebugEnabled())
-                LOG.debug("Filtering {}", request);
-
-            // Get a rate tracker associated with this request, and record one hit.
-            tracker = getRateTracker(request);
-
-            // Calculate the rate and check if it is over the allowed limit
-            final boolean overRateLimit = tracker.isRateExceeded(System.currentTimeMillis());
-
-            // Pass it through if we are not currently over the rate limit.
-            if (!overRateLimit)
-            {
-                if (LOG.isDebugEnabled())
-                    LOG.debug("Allowing {}", request);
-                doFilterChain(filterChain, request, response);
-                return;
-            }
-
-            // We are over the limit.
-
-            // So either reject it, delay it or throttle it.
-            long delayMs = getDelayMs();
-            boolean insertHeaders = isInsertHeaders();
-            switch ((int)delayMs)
-            {
-                case -1:
-                {
-                    // Reject this request.
-                    _listener.onRequestRejected(request);
-                    if (insertHeaders)
-                        response.addHeader("DoSFilter", "unavailable");
-                    response.sendError(getTooManyCode());
-                    return;
-                }
-                case 0:
-                {
-                    // Fall through to throttle the request.
-                    _listener.onRequestThrottled(request);
-                    request.setAttribute(__TRACKER, tracker);
-                    break;
-                }
-                default:
-                {
-                    // Insert a delay before throttling the request,
-                    // using the suspend+timeout mechanism of AsyncContext.
-                    _listener.onRequestDelayed(request, delayMs);
-                    if (insertHeaders)
-                        response.addHeader("DoSFilter", "delayed");
-                    request.setAttribute(__TRACKER, tracker);
-                    AsyncContext asyncContext = request.startAsync();
-                    if (delayMs > 0)
-                        asyncContext.setTimeout(delayMs);
-                    asyncContext.addListener(new DoSTimeoutAsyncListener());
-                    return;
-                }
-            }
+            // Redispatched, RateTracker present in request attributes.
+            throttleRequest(request, response, filterChain, tracker);
+            return;
         }
 
+        // This is the first time we have seen this request.
+        if (LOG.isDebugEnabled())
+            LOG.debug("Filtering {}", request);
+
+        // Get a rate tracker associated with this request, and record one hit.
+        tracker = getRateTracker(request);
+
+        // Calculate the rate and check if it is over the allowed limit
+        final boolean overRateLimit = tracker.isRateExceeded(System.currentTimeMillis());
+
+        // Pass it through if we are not currently over the rate limit.
+        if (!overRateLimit)
+        {
+            if (LOG.isDebugEnabled())
+                LOG.debug("Allowing {}", request);
+            doFilterChain(filterChain, request, response);
+            return;
+        }
+
+        // We are over the limit.
+
+        // So either reject it, delay it or throttle it.
+        long delayMs = getDelayMs();
+        Action wantedAction;
+        if (delayMs == -1)
+            wantedAction = Action.REJECT;
+        else if (delayMs == 0)
+            wantedAction = Action.THROTTLE;
+        else
+            wantedAction = Action.DELAY;
+
+        // Ask listener what to perform.
+        Action action = _listener.onRequestOverLimit(wantedAction, request, this);
+
+        // Perform action
+        boolean insertHeaders = isInsertHeaders();
+        switch (action)
+        {
+            case NO_ACTION:
+                if (LOG.isDebugEnabled())
+                    LOG.debug("Allowing over-limit request {}", request);
+                doFilterChain(filterChain, request, response);
+                break;
+            case REJECT:
+                if (insertHeaders)
+                    response.addHeader("DoSFilter", "unavailable");
+                response.sendError(getTooManyCode());
+                break;
+            case DELAY:
+                // Insert a delay before throttling the request,
+                // using the suspend+timeout mechanism of AsyncContext.
+                if (insertHeaders)
+                    response.addHeader("DoSFilter", "delayed");
+                request.setAttribute(__TRACKER, tracker);
+                AsyncContext asyncContext = request.startAsync();
+                if (delayMs > 0)
+                    asyncContext.setTimeout(delayMs);
+                asyncContext.addListener(new DoSTimeoutAsyncListener());
+                break;
+            case THROTTLE:
+                throttleRequest(request, response, filterChain, tracker);
+                break;
+        }
+    }
+
+    private void throttleRequest(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain, RateTracker tracker) throws IOException, ServletException
+    {
         if (LOG.isDebugEnabled())
             LOG.debug("Throttling {}", request);
 
@@ -1393,44 +1406,45 @@ public class DoSFilter implements Filter
         }
     }
 
+    public enum Action
+    {
+        NO_ACTION,
+        REJECT,
+        DELAY,
+        THROTTLE;
+    }
+
     /**
      * Listener for actions taken against specific requests.
      */
     public static class Listener
     {
         /**
-         * Too many requests detected.
-         * <p>
-         * Will result in a {@link HttpServletResponse#sendError(int)} using configured
-         * {@link DoSFilter#getTooManyCode()}
-         * </p>
+         * Process the onRequestOverLimit() behavior.
          *
-         * @param request the request being rejected
+         * @param wantedAction the action that DoSFilter wants to do.
+         * @param request the request that is over the limit
+         * @param dosFilter the {@link DoSFilter} that this event occurred on
+         * @return the action to actually perform. (return <code>wantedAction</code> if you want default behavior)
          */
-        public void onRequestRejected(HttpServletRequest request)
+        public Action onRequestOverLimit(Action wantedAction, HttpServletRequest request, DoSFilter dosFilter)
         {
-            LOG.warn("DOS ALERT: Request rejected ip={}, session={}, user={}", request.getRemoteAddr(), request.getRequestedSessionId(), request.getUserPrincipal());
-        }
+            switch (wantedAction)
+            {
+                case NO_ACTION:
+                    break;
+                case REJECT:
+                    LOG.warn("DOS ALERT: Request rejected ip={}, session={}, user={}", request.getRemoteAddr(), request.getRequestedSessionId(), request.getUserPrincipal());
+                    break;
+                case DELAY:
+                    LOG.warn("DOS ALERT: Request delayed={}ms, ip={}, session={}, user={}", dosFilter.getDelayMs(), request.getRemoteAddr(), request.getRequestedSessionId(), request.getUserPrincipal());
+                    break;
+                case THROTTLE:
+                    LOG.warn("DOS ALERT: Request throttled ip={}, session={}, user={}", request.getRemoteAddr(), request.getRequestedSessionId(), request.getUserPrincipal());
+                    break;
+            }
 
-        /**
-         * The request that will be throttled.
-         *
-         * @param request the request that will be throttled.
-         */
-        public void onRequestThrottled(HttpServletRequest request)
-        {
-            LOG.warn("DOS ALERT: Request throttled ip={}, session={}, user={}", request.getRemoteAddr(), request.getRequestedSessionId(), request.getUserPrincipal());
-        }
-
-        /**
-         * The request that will be delayed before being throttled.
-         *
-         * @param request the request that will be delayed
-         * @param delayMs the delay in milliseconds
-         */
-        public void onRequestDelayed(HttpServletRequest request, long delayMs)
-        {
-            LOG.warn("DOS ALERT: Request delayed={}ms, ip={}, session={}, user={}", delayMs, request.getRemoteAddr(), request.getRequestedSessionId(), request.getUserPrincipal());
+            return wantedAction;
         }
     }
 }
