@@ -23,6 +23,7 @@ import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Objects;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -181,6 +182,7 @@ public class DoSFilter implements Filter
     private volatile boolean _remotePort;
     private volatile boolean _enabled;
     private volatile String _name;
+    private DoSFilter.Listener _listener = new Listener();
     private Semaphore _passes;
     private volatile int _throttledRequests;
     private volatile int _maxRequestsPerSec;
@@ -336,7 +338,7 @@ public class DoSFilter implements Filter
                 case -1:
                 {
                     // Reject this request.
-                    LOG.warn("DOS ALERT: Request rejected ip={}, session={}, user={}", request.getRemoteAddr(), request.getRequestedSessionId(), request.getUserPrincipal());
+                    _listener.onRequestRejected(request);
                     if (insertHeaders)
                         response.addHeader("DoSFilter", "unavailable");
                     response.sendError(getTooManyCode());
@@ -345,7 +347,7 @@ public class DoSFilter implements Filter
                 case 0:
                 {
                     // Fall through to throttle the request.
-                    LOG.warn("DOS ALERT: Request throttled ip={}, session={}, user={}", request.getRemoteAddr(), request.getRequestedSessionId(), request.getUserPrincipal());
+                    _listener.onRequestThrottled(request);
                     request.setAttribute(__TRACKER, tracker);
                     break;
                 }
@@ -353,7 +355,7 @@ public class DoSFilter implements Filter
                 {
                     // Insert a delay before throttling the request,
                     // using the suspend+timeout mechanism of AsyncContext.
-                    LOG.warn("DOS ALERT: Request delayed={}ms, ip={}, session={}, user={}", delayMs, request.getRemoteAddr(), request.getRequestedSessionId(), request.getUserPrincipal());
+                    _listener.onRequestDelayed(request, delayMs);
                     if (insertHeaders)
                         response.addHeader("DoSFilter", "delayed");
                     request.setAttribute(__TRACKER, tracker);
@@ -545,6 +547,16 @@ public class DoSFilter implements Filter
     protected int getMaxPriority()
     {
         return USER_AUTH;
+    }
+
+    public void setListener(DoSFilter.Listener listener)
+    {
+        _listener = Objects.requireNonNull(listener, "Listener may not be null");
+    }
+
+    public DoSFilter.Listener getListener()
+    {
+        return _listener;
     }
 
     private void schedule(RateTracker tracker)
@@ -1062,6 +1074,11 @@ public class DoSFilter implements Filter
         _enabled = enabled;
     }
 
+    /**
+     * Status code for Rejected for too many requests.
+     *
+     * @return the configured status code (default: 429 - Too Many Requests)
+     */
     public int getTooManyCode()
     {
         return _tooManyCode;
@@ -1148,6 +1165,13 @@ public class DoSFilter implements Filter
     public boolean removeWhitelistAddress(@Name("address") String address)
     {
         return _whitelist.remove(address);
+    }
+
+    private String createRemotePortId(ServletRequest request)
+    {
+        String addr = request.getRemoteAddr();
+        int port = request.getRemotePort();
+        return addr + ":" + port;
     }
 
     /**
@@ -1369,10 +1393,44 @@ public class DoSFilter implements Filter
         }
     }
 
-    private String createRemotePortId(ServletRequest request)
+    /**
+     * Listener for actions taken against specific requests.
+     */
+    public static class Listener
     {
-        String addr = request.getRemoteAddr();
-        int port = request.getRemotePort();
-        return addr + ":" + port;
+        /**
+         * Too many requests detected.
+         * <p>
+         * Will result in a {@link HttpServletResponse#sendError(int)} using configured
+         * {@link DoSFilter#getTooManyCode()}
+         * </p>
+         *
+         * @param request the request being rejected
+         */
+        public void onRequestRejected(HttpServletRequest request)
+        {
+            LOG.warn("DOS ALERT: Request rejected ip={}, session={}, user={}", request.getRemoteAddr(), request.getRequestedSessionId(), request.getUserPrincipal());
+        }
+
+        /**
+         * The request that will be throttled.
+         *
+         * @param request the request that will be throttled.
+         */
+        public void onRequestThrottled(HttpServletRequest request)
+        {
+            LOG.warn("DOS ALERT: Request throttled ip={}, session={}, user={}", request.getRemoteAddr(), request.getRequestedSessionId(), request.getUserPrincipal());
+        }
+
+        /**
+         * The request that will be delayed before being throttled.
+         *
+         * @param request the request that will be delayed
+         * @param delayMs the delay in milliseconds
+         */
+        public void onRequestDelayed(HttpServletRequest request, long delayMs)
+        {
+            LOG.warn("DOS ALERT: Request delayed={}ms, ip={}, session={}, user={}", delayMs, request.getRemoteAddr(), request.getRequestedSessionId(), request.getUserPrincipal());
+        }
     }
 }
