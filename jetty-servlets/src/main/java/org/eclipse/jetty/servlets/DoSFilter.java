@@ -335,20 +335,11 @@ public class DoSFilter implements Filter
 
         // We are over the limit.
 
-        // So either reject it, delay it or throttle it.
-        long delayMs = getDelayMs();
-        Action wantedAction;
-        if (delayMs == -1)
-            wantedAction = Action.REJECT;
-        else if (delayMs == 0)
-            wantedAction = Action.THROTTLE;
-        else
-            wantedAction = Action.DELAY;
-
         // Ask listener what to perform.
-        Action action = _listener.onRequestOverLimit(wantedAction, request, this);
+        Action action = _listener.onRequestOverLimit(request, this);
 
         // Perform action
+        long delayMs = getDelayMs();
         boolean insertHeaders = isInsertHeaders();
         switch (action)
         {
@@ -357,11 +348,16 @@ public class DoSFilter implements Filter
                     LOG.debug("Allowing over-limit request {}", request);
                 doFilterChain(filterChain, request, response);
                 break;
+            case ABORT:
+                if (LOG.isDebugEnabled())
+                    LOG.debug("Aborting over-limit request {}", request);
+                response.sendError(-1);
+                return;
             case REJECT:
                 if (insertHeaders)
                     response.addHeader("DoSFilter", "unavailable");
                 response.sendError(getTooManyCode());
-                break;
+                return;
             case DELAY:
                 // Insert a delay before throttling the request,
                 // using the suspend+timeout mechanism of AsyncContext.
@@ -1408,10 +1404,37 @@ public class DoSFilter implements Filter
 
     public enum Action
     {
+        /**
+         * No action is taken against the Request, it is allowed to be processed normally.
+         */
         NO_ACTION,
+        /**
+         * The request and response is aborted, no response is sent.
+         */
+        ABORT,
+        /**
+         * The request is rejected by sending an error based on {@link DoSFilter#getTooManyCode()}
+         */
         REJECT,
+        /**
+         * The request is delayed based on {@link DoSFilter#getDelayMs()}
+         */
         DELAY,
+        /**
+         * The request is throttled.
+         */
         THROTTLE;
+
+        public static Action fromDelay(long delayMs)
+        {
+            if (delayMs < 0)
+                return Action.REJECT;
+
+            if (delayMs == 0)
+                return Action.THROTTLE;
+
+            return Action.DELAY;
+        }
     }
 
     /**
@@ -1422,17 +1445,16 @@ public class DoSFilter implements Filter
         /**
          * Process the onRequestOverLimit() behavior.
          *
-         * @param wantedAction the action that DoSFilter wants to do.
          * @param request the request that is over the limit
          * @param dosFilter the {@link DoSFilter} that this event occurred on
          * @return the action to actually perform. (return <code>wantedAction</code> if you want default behavior)
          */
-        public Action onRequestOverLimit(Action wantedAction, HttpServletRequest request, DoSFilter dosFilter)
+        public Action onRequestOverLimit(HttpServletRequest request, DoSFilter dosFilter)
         {
-            switch (wantedAction)
+            Action action = Action.fromDelay(dosFilter.getDelayMs());
+
+            switch (action)
             {
-                case NO_ACTION:
-                    break;
                 case REJECT:
                     LOG.warn("DOS ALERT: Request rejected ip={}, session={}, user={}", request.getRemoteAddr(), request.getRequestedSessionId(), request.getUserPrincipal());
                     break;
@@ -1444,7 +1466,7 @@ public class DoSFilter implements Filter
                     break;
             }
 
-            return wantedAction;
+            return action;
         }
     }
 }
