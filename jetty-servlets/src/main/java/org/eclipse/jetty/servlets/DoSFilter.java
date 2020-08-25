@@ -1425,6 +1425,12 @@ public class DoSFilter implements Filter
          */
         THROTTLE;
 
+        /**
+         * Obtain the Action based on configured {@link DoSFilter#getDelayMs()}
+         *
+         * @param delayMs the delay in milliseconds.
+         * @return the Action proposed.
+         */
         public static Action fromDelay(long delayMs)
         {
             if (delayMs < 0)
@@ -1447,7 +1453,7 @@ public class DoSFilter implements Filter
          *
          * @param request the request that is over the limit
          * @param dosFilter the {@link DoSFilter} that this event occurred on
-         * @return the action to actually perform. (return <code>wantedAction</code> if you want default behavior)
+         * @return the action to actually perform.
          */
         public Action onRequestOverLimit(HttpServletRequest request, DoSFilter dosFilter)
         {
