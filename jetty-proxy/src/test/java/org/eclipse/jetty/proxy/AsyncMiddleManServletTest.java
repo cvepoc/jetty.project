@@ -79,6 +79,7 @@ import org.eclipse.jetty.util.log.Logger;
 import org.eclipse.jetty.util.log.StacklessLogging;
 import org.eclipse.jetty.util.thread.QueuedThreadPool;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -102,7 +103,6 @@ public class AsyncMiddleManServletTest
     private ServerConnector proxyConnector;
     private Server server;
     private ServerConnector serverConnector;
-    private StacklessLogging stackless;
 
     private void startServer(HttpServlet servlet) throws Exception
     {
@@ -145,8 +145,6 @@ public class AsyncMiddleManServletTest
         proxyContext.addServlet(proxyServletHolder, "/*");
 
         proxy.start();
-
-        stackless = new StacklessLogging(proxyServlet._log);
     }
 
     private void startClient() throws Exception
@@ -165,7 +163,6 @@ public class AsyncMiddleManServletTest
         client.stop();
         proxy.stop();
         server.stop();
-        stackless.close();
     }
 
     @Test
@@ -497,8 +494,7 @@ public class AsyncMiddleManServletTest
     @Test
     public void testUpstreamTransformationThrowsBeforeCommittingProxyRequest() throws Exception
     {
-        startServer(new EchoHttpServlet());
-        startProxy(new AsyncMiddleManServlet()
+        AsyncMiddleManServlet proxyServlet = new AsyncMiddleManServlet()
         {
             @Override
             protected ContentTransformer newClientRequestContentTransformer(HttpServletRequest clientRequest, Request proxyRequest)
@@ -508,46 +504,52 @@ public class AsyncMiddleManServletTest
                     throw new NullPointerException("explicitly_thrown_by_test");
                 };
             }
-        });
+        };
+        startServer(new EchoHttpServlet());
+        startProxy(proxyServlet);
         startClient();
 
-        byte[] bytes = new byte[1024];
-        ContentResponse response = client.newRequest("localhost", serverConnector.getLocalPort())
-            .content(new BytesContentProvider(bytes))
-            .timeout(5, TimeUnit.SECONDS)
-            .send();
+        try (StacklessLogging ignored = new StacklessLogging(proxyServlet._log))
+        {
+            byte[] bytes = new byte[1024];
+            ContentResponse response = client.newRequest("localhost", serverConnector.getLocalPort())
+                .content(new BytesContentProvider(bytes))
+                .timeout(5, TimeUnit.SECONDS)
+                .send();
 
-        assertEquals(500, response.getStatus());
+            assertEquals(500, response.getStatus());
+        }
     }
 
     @Test
     public void testUpstreamTransformationThrowsAfterCommittingProxyRequest() throws Exception
     {
-        try (StacklessLogging ignored = new StacklessLogging(HttpChannel.class))
+        AsyncMiddleManServlet proxyServlet = new AsyncMiddleManServlet()
         {
-            startServer(new EchoHttpServlet());
-            startProxy(new AsyncMiddleManServlet()
+            @Override
+            protected ContentTransformer newClientRequestContentTransformer(HttpServletRequest clientRequest, Request proxyRequest)
             {
-                @Override
-                protected ContentTransformer newClientRequestContentTransformer(HttpServletRequest clientRequest, Request proxyRequest)
+                return new ContentTransformer()
                 {
-                    return new ContentTransformer()
+                    private int count;
+
+                    @Override
+                    public void transform(ByteBuffer input, boolean finished, List<ByteBuffer> output)
                     {
-                        private int count;
+                        if (++count < 2)
+                            output.add(input);
+                        else
+                            throw new NullPointerException("explicitly_thrown_by_test");
+                    }
+                };
+            }
+        };
+        startServer(new EchoHttpServlet());
+        startProxy(proxyServlet);
+        startClient();
 
-                        @Override
-                        public void transform(ByteBuffer input, boolean finished, List<ByteBuffer> output)
-                        {
-                            if (++count < 2)
-                                output.add(input);
-                            else
-                                throw new NullPointerException("explicitly_thrown_by_test");
-                        }
-                    };
-                }
-            });
-            startClient();
-
+        try (StacklessLogging ignored = new StacklessLogging(proxyServlet._log))
+        {
             CountDownLatch latch = new CountDownLatch(1);
             DeferredContentProvider content = new DeferredContentProvider();
             client.newRequest("localhost", serverConnector.getLocalPort())
@@ -605,8 +607,7 @@ public class AsyncMiddleManServletTest
 
     private void testDownstreamTransformationThrows(HttpServlet serverServlet) throws Exception
     {
-        startServer(serverServlet);
-        startProxy(new AsyncMiddleManServlet()
+        AsyncMiddleManServlet proxyServlet = new AsyncMiddleManServlet()
         {
             @Override
             protected ContentTransformer newServerResponseContentTransformer(HttpServletRequest clientRequest, HttpServletResponse proxyResponse, Response serverResponse)
@@ -625,14 +626,19 @@ public class AsyncMiddleManServletTest
                     }
                 };
             }
-        });
+        };
+        startServer(serverServlet);
+        startProxy(proxyServlet);
         startClient();
 
-        ContentResponse response = client.newRequest("localhost", serverConnector.getLocalPort())
-            .timeout(5, TimeUnit.SECONDS)
-            .send();
+        try (StacklessLogging ignored = new StacklessLogging(proxyServlet._log))
+        {
+            ContentResponse response = client.newRequest("localhost", serverConnector.getLocalPort())
+                .timeout(5, TimeUnit.SECONDS)
+                .send();
 
-        assertEquals(502, response.getStatus());
+            assertEquals(502, response.getStatus());
+        }
     }
 
     @Test
@@ -983,9 +989,16 @@ public class AsyncMiddleManServletTest
     }
 
     @Test
+    @Tag("overflow")
     public void testAfterContentTransformerOverflowingToDisk() throws Exception
     {
         // Make sure the temporary directory we use exists and it's empty.
+        Path path = workDir.getPath();
+        if (Files.exists(path))
+        {
+            LOG.info("WorkDir exists: {}", path);
+            Files.list(path).forEach((p) -> LOG.info("WorkDir Contains: {}", p));
+        }
         Path targetTestsDir = workDir.getEmptyPathDir();
 
         String key0 = "id";
@@ -1048,11 +1061,6 @@ public class AsyncMiddleManServletTest
         assertEquals(2, obj.size());
         assertEquals(value0, obj.get(key0));
         assertEquals(value1, obj.get(key2));
-        // Make sure the files do not exist.
-        try (DirectoryStream<Path> paths = Files.newDirectoryStream(targetTestsDir, inputPrefix + "*.*"))
-        {
-            assertFalse(paths.iterator().hasNext());
-        }
 
         // File deletion is delayed on windows, testing for deletion is not going to work
         if (!OS.WINDOWS.isCurrentOs())
@@ -1065,6 +1073,7 @@ public class AsyncMiddleManServletTest
     }
 
     @Test
+    @Tag("overflow")
     public void testAfterContentTransformerClosingFilesOnClientRequestException() throws Exception
     {
         Path targetTestsDir = workDir.getEmptyPathDir();
@@ -1130,6 +1139,7 @@ public class AsyncMiddleManServletTest
     }
 
     @Test
+    @Tag("overflow")
     public void testAfterContentTransformerClosingFilesOnServerResponseException() throws Exception
     {
         Path targetTestsDir = workDir.getEmptyPathDir();
